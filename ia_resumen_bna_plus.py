@@ -284,39 +284,46 @@ st.subheader("Conciliación bancaria")
 # - primer movimiento: menor FECHA y, si coincide, menor COMPROBANTE
 df = df.sort_values(["fecha","comp_num","orden"]).reset_index(drop=True)
 
-primer_saldo = float(df["saldo"].iloc[0])
-primer_importe = float(df["importe"].iloc[0])
+# BNA+ (según tu regla):
+# - El PRIMER saldo que aparece (fecha más antigua) ES el "saldo anterior" del período.
+# - El saldo final NO aparece en el PDF: se infiere desde el ÚLTIMO saldo que aparece
+#   (previo al último movimiento) aplicando el ÚLTIMO importe.
+saldo_anterior = float(df["saldo"].iloc[0])
 
-# SALDO ANTERIOR no existe: se infiere desde el 1er saldo y el 1er importe
-# Si el importe fue débito (negativo), el saldo anterior era mayor: saldo + importe
-# Si el importe fue crédito (positivo), el saldo anterior era menor: saldo - importe
-if primer_importe < 0:
-    saldo_anterior = primer_saldo + primer_importe
-else:
-    saldo_anterior = primer_saldo - primer_importe
+ultimo_saldo_aparece = float(df["saldo"].iloc[-1])
+ultimo_importe = float(df["importe"].iloc[-1])
 
-saldo_final_pdf = float(df["saldo"].iloc[-1])
+saldo_final_inferido = ultimo_saldo_aparece + ultimo_importe  # aplica +/-
 
 total_debitos = float(df["debito"].sum())
 total_creditos = float(df["credito"].sum())
 
-saldo_final_calculado = saldo_anterior + total_creditos - total_debitos
-diferencia = saldo_final_calculado - saldo_final_pdf
+# Conciliación: saldo_final_calculado desde saldo anterior + sum(importes)
+saldo_final_calculado = saldo_anterior + float(df["importe"].sum())
+diferencia = saldo_final_calculado - saldo_final_inferido
 cuadra = abs(diferencia) < 0.01
 
-# Mostrar sin truncar: 3 columnas + 2 columnas
+# Mostrar sin truncar
 r1c1, r1c2, r1c3 = st.columns(3)
 with r1c1:
-    st.metric("Saldo anterior", f"$ {fmt_ar(saldo_anterior)}")
+    st.metric("Saldo anterior (1er saldo)", f"$ {fmt_ar(saldo_anterior)}")
 with r1c2:
     st.metric("Total débitos (–)", f"$ {fmt_ar(total_debitos)}")
 with r1c3:
     st.metric("Total créditos (+)", f"$ {fmt_ar(total_creditos)}")
 
-r2c1, r2c2 = st.columns(2)
+r2c1, r2c2, r2c3 = st.columns(3)
 with r2c1:
-    st.metric("Saldo final (PDF)", f"$ {fmt_ar(saldo_final_pdf)}")
+    st.metric("Último saldo que aparece", f"$ {fmt_ar(ultimo_saldo_aparece)}")
 with r2c2:
+    st.metric("Último importe", f"$ {fmt_ar(ultimo_importe)}")
+with r2c3:
+    st.metric("Saldo final inferido", f"$ {fmt_ar(saldo_final_inferido)}")
+
+r3c1, r3c2 = st.columns(2)
+with r3c1:
+    st.metric("Saldo final calculado", f"$ {fmt_ar(saldo_final_calculado)}")
+with r3c2:
     st.metric("Diferencia", f"$ {fmt_ar(diferencia)}")
 
 if cuadra:
