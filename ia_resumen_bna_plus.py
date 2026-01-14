@@ -277,16 +277,49 @@ diferencia = saldo_final_calculado - saldo_final
 cuadra = abs(diferencia) < 0.01
 
 st.subheader("Conciliación bancaria")
-c1, c2, c3 = st.columns(3)
+
+# --- SALDO ANTERIOR (no existe en el PDF) ---
+# Regla solicitada:
+# - Tomar el primer saldo que aparece (saldo del 1er movimiento)
+# - Ajustar con el 1er importe:
+#     si importe < 0  -> saldo_anterior = saldo + importe
+#     si importe > 0  -> saldo_anterior = saldo - importe
+primer_saldo = float(df["saldo"].iloc[0])
+primer_importe = float(df["importe"].iloc[0])
+
+if primer_importe < 0:
+    saldo_anterior = primer_saldo + primer_importe
+else:
+    saldo_anterior = primer_saldo - primer_importe
+
+saldo_final_pdf = float(df["saldo"].iloc[-1])
+
+total_debitos = float(df["debito"].sum())
+total_creditos = float(df["credito"].sum())
+
+saldo_final_calculado = saldo_anterior + total_creditos - total_debitos
+diferencia = saldo_final_calculado - saldo_final_pdf
+cuadra = abs(diferencia) < 0.01
+
+c1, c2, c3, c4, c5 = st.columns(5)
 with c1:
-    st.metric("Saldo inicial", f"$ {fmt_ar(saldo_inicial)}")
+    st.metric("Saldo anterior", f"$ {fmt_ar(saldo_anterior)}")
 with c2:
-    st.metric("Saldo final (PDF)", f"$ {fmt_ar(saldo_final)}")
+    st.metric("Total débitos (–)", f"$ {fmt_ar(total_debitos)}")
 with c3:
+    st.metric("Total créditos (+)", f"$ {fmt_ar(total_creditos)}")
+with c4:
+    st.metric("Saldo final (PDF)", f"$ {fmt_ar(saldo_final_pdf)}")
+with c5:
     st.metric("Diferencia", f"$ {fmt_ar(diferencia)}")
-st.success("Conciliado.") if cuadra else st.error("No cuadra la conciliación.")
+
+if cuadra:
+    st.success("Conciliado.")
+else:
+    st.error("No cuadra la conciliación.")
 
 st.subheader("Resumen Operativo: Registración Módulo IVA")
+
 resumen = build_resumen_operativo(df)
 res_view = resumen.copy()
 res_view["Importe"] = res_view["Importe"].map(fmt_ar)
