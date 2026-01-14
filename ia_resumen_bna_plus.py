@@ -261,7 +261,8 @@ if df.empty:
     st.error("No se detectaron movimientos. Este PDF tiene un layout distinto o está escaneado.")
     st.stop()
 
-df = df.sort_values(["fecha", "orden"]).reset_index(drop=True)
+df["comp_num"] = pd.to_numeric(df["comprobante"], errors="coerce")
+df = df.sort_values(["fecha","comp_num","orden"]).reset_index(drop=True)
 
 df["debito"] = np.where(df["importe"] < 0, -df["importe"], 0.0)
 df["credito"] = np.where(df["importe"] > 0, df["importe"], 0.0)
@@ -278,15 +279,17 @@ cuadra = abs(diferencia) < 0.01
 
 st.subheader("Conciliación bancaria")
 
-# --- SALDO ANTERIOR (no existe en el PDF) ---
-# Regla solicitada:
-# - Tomar el primer saldo que aparece (saldo del 1er movimiento)
-# - Ajustar con el 1er importe:
-#     si importe < 0  -> saldo_anterior = saldo + importe
-#     si importe > 0  -> saldo_anterior = saldo - importe
+# Orden lógico del período:
+# - último movimiento: mayor FECHA y, si coincide, mayor COMPROBANTE
+# - primer movimiento: menor FECHA y, si coincide, menor COMPROBANTE
+df = df.sort_values(["fecha","comp_num","orden"]).reset_index(drop=True)
+
 primer_saldo = float(df["saldo"].iloc[0])
 primer_importe = float(df["importe"].iloc[0])
 
+# SALDO ANTERIOR no existe: se infiere desde el 1er saldo y el 1er importe
+# Si el importe fue débito (negativo), el saldo anterior era mayor: saldo + importe
+# Si el importe fue crédito (positivo), el saldo anterior era menor: saldo - importe
 if primer_importe < 0:
     saldo_anterior = primer_saldo + primer_importe
 else:
@@ -301,16 +304,19 @@ saldo_final_calculado = saldo_anterior + total_creditos - total_debitos
 diferencia = saldo_final_calculado - saldo_final_pdf
 cuadra = abs(diferencia) < 0.01
 
-c1, c2, c3, c4, c5 = st.columns(5)
-with c1:
+# Mostrar sin truncar: 3 columnas + 2 columnas
+r1c1, r1c2, r1c3 = st.columns(3)
+with r1c1:
     st.metric("Saldo anterior", f"$ {fmt_ar(saldo_anterior)}")
-with c2:
+with r1c2:
     st.metric("Total débitos (–)", f"$ {fmt_ar(total_debitos)}")
-with c3:
+with r1c3:
     st.metric("Total créditos (+)", f"$ {fmt_ar(total_creditos)}")
-with c4:
+
+r2c1, r2c2 = st.columns(2)
+with r2c1:
     st.metric("Saldo final (PDF)", f"$ {fmt_ar(saldo_final_pdf)}")
-with c5:
+with r2c2:
     st.metric("Diferencia", f"$ {fmt_ar(diferencia)}")
 
 if cuadra:
@@ -326,7 +332,7 @@ res_view["Importe"] = res_view["Importe"].map(fmt_ar)
 st.dataframe(res_view, use_container_width=True)
 
 st.subheader("Detalle de movimientos")
-df_view = df.copy()
+df_view = df.drop(columns=["comp_num"], errors="ignore").copy()
 for c in ["importe", "debito", "credito", "saldo"]:
     df_view[c] = df_view[c].map(fmt_ar)
 st.dataframe(
@@ -341,7 +347,7 @@ try:
     import xlsxwriter  # noqa: F401
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=False, sheet_name="Movimientos")
+        df.drop(columns=["comp_num"], errors="ignore").to_excel(writer, index=False, sheet_name="Movimientos")
         resumen.to_excel(writer, index=False, sheet_name="Resumen_Operativo")
         wb = writer.book
         money_fmt = wb.add_format({"num_format": "#,##0.00"})
@@ -368,7 +374,7 @@ try:
         use_container_width=True,
     )
 except Exception:
-    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+    csv_bytes = df.drop(columns=["comp_num"], errors="ignore").to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         "📥 Descargar CSV (fallback)",
         data=csv_bytes,
