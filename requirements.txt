@@ -4,3 +4,4 @@ numpy
 pdfplumber
 xlsxwriter
 reportlab
+Pillow
