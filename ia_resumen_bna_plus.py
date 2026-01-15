@@ -262,7 +262,14 @@ if df.empty:
     st.stop()
 
 df["comp_num"] = pd.to_numeric(df["comprobante"], errors="coerce")
-df = df.sort_values(["fecha","comp_num","orden"]).reset_index(drop=True)
+df = df.sort_values(["fecha", "comp_num", "orden"]).reset_index(drop=True)
+
+# BNA+:
+# En este layout, el "Saldo" representa el saldo del sistema antes del movimiento siguiente,
+# por lo que el importe más confiable se obtiene por diferencia de saldos.
+# (El último movimiento no tiene "saldo siguiente": se mantiene el importe leído del PDF).
+df["importe_calc"] = df["saldo"].shift(-1) - df["saldo"]
+df["importe"] = df["importe_calc"].where(df["importe_calc"].notna(), df["importe"])
 
 df["debito"] = np.where(df["importe"] < 0, -df["importe"], 0.0)
 df["credito"] = np.where(df["importe"] > 0, df["importe"], 0.0)
@@ -279,31 +286,28 @@ cuadra = abs(diferencia) < 0.01
 
 st.subheader("Conciliación bancaria")
 
-# Orden lógico del período:
-# - último movimiento: mayor FECHA y, si coincide, mayor COMPROBANTE
-# - primer movimiento: menor FECHA y, si coincide, menor COMPROBANTE
-df = df.sort_values(["fecha","comp_num","orden"]).reset_index(drop=True)
+# Reglas BNA+ (según tu criterio operativo):
+# - Saldo anterior: PRIMER saldo del período (fecha más antigua).
+# - El saldo final NO está impreso: se infiere aplicando el ÚLTIMO importe al ÚLTIMO saldo impreso.
+#
+# Nota técnica:
+# Para robustez, el "importe" se recalcula por diferencia de saldos (excepto el último),
+# por lo que la conciliación debe cerrar salvo que falten movimientos en el PDF.
 
-# BNA+ (según tu regla):
-# - El PRIMER saldo que aparece (fecha más antigua) ES el "saldo anterior" del período.
-# - El saldo final NO aparece en el PDF: se infiere desde el ÚLTIMO saldo que aparece
-#   (previo al último movimiento) aplicando el ÚLTIMO importe.
 saldo_anterior = float(df["saldo"].iloc[0])
 
-ultimo_saldo_aparece = float(df["saldo"].iloc[-1])
+ultimo_saldo_impreso = float(df["saldo"].iloc[-1])
 ultimo_importe = float(df["importe"].iloc[-1])
 
-saldo_final_inferido = ultimo_saldo_aparece + ultimo_importe  # aplica +/-
+saldo_final_inferido = ultimo_saldo_impreso + ultimo_importe
 
 total_debitos = float(df["debito"].sum())
 total_creditos = float(df["credito"].sum())
 
-# Conciliación: saldo_final_calculado desde saldo anterior + sum(importes)
 saldo_final_calculado = saldo_anterior + float(df["importe"].sum())
 diferencia = saldo_final_calculado - saldo_final_inferido
 cuadra = abs(diferencia) < 0.01
 
-# Mostrar sin truncar
 r1c1, r1c2, r1c3 = st.columns(3)
 with r1c1:
     st.metric("Saldo anterior (1er saldo)", f"$ {fmt_ar(saldo_anterior)}")
@@ -314,15 +318,15 @@ with r1c3:
 
 r2c1, r2c2, r2c3 = st.columns(3)
 with r2c1:
-    st.metric("Último saldo que aparece", f"$ {fmt_ar(ultimo_saldo_aparece)}")
+    st.metric("Último saldo impreso", f"$ {fmt_ar(ultimo_saldo_impreso)}")
 with r2c2:
     st.metric("Último importe", f"$ {fmt_ar(ultimo_importe)}")
 with r2c3:
-    st.metric("Saldo final inferido", f"$ {fmt_ar(saldo_final_inferido)}")
+    st.metric("Saldo final (inferido)", f"$ {fmt_ar(saldo_final_inferido)}")
 
 r3c1, r3c2 = st.columns(2)
 with r3c1:
-    st.metric("Saldo final calculado", f"$ {fmt_ar(saldo_final_calculado)}")
+    st.metric("Saldo final (calculado)", f"$ {fmt_ar(saldo_final_calculado)}")
 with r3c2:
     st.metric("Diferencia", f"$ {fmt_ar(diferencia)}")
 
@@ -339,7 +343,7 @@ res_view["Importe"] = res_view["Importe"].map(fmt_ar)
 st.dataframe(res_view, use_container_width=True)
 
 st.subheader("Detalle de movimientos")
-df_view = df.drop(columns=["comp_num"], errors="ignore").copy()
+df_view = df.drop(columns=["comp_num","importe_calc"], errors="ignore").copy()
 for c in ["importe", "debito", "credito", "saldo"]:
     df_view[c] = df_view[c].map(fmt_ar)
 st.dataframe(
@@ -354,7 +358,7 @@ try:
     import xlsxwriter  # noqa: F401
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
-        df.drop(columns=["comp_num"], errors="ignore").to_excel(writer, index=False, sheet_name="Movimientos")
+        df.drop(columns=["comp_num","importe_calc"], errors="ignore").to_excel(writer, index=False, sheet_name="Movimientos")
         resumen.to_excel(writer, index=False, sheet_name="Resumen_Operativo")
         wb = writer.book
         money_fmt = wb.add_format({"num_format": "#,##0.00"})
@@ -381,7 +385,7 @@ try:
         use_container_width=True,
     )
 except Exception:
-    csv_bytes = df.drop(columns=["comp_num"], errors="ignore").to_csv(index=False).encode("utf-8-sig")
+    csv_bytes = df.drop(columns=["comp_num","importe_calc"], errors="ignore").to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         "📥 Descargar CSV (fallback)",
         data=csv_bytes,
