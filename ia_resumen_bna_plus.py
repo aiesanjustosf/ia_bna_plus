@@ -95,132 +95,142 @@ def extract_text_lines(file_like) -> list[str]:
     return out
 
 
-def merge_bna_plus_rows(lines: list[str]) -> list[str]:
+def parse_bna_plus_lines_to_df(lines: list[str]) -> pd.DataFrame:
     """
-    En BNA+ suele venir en 2-3 líneas por fila:
+    Parser robusto BNA+.
+
+    El PDF suele representar cada movimiento en 2-3 líneas:
       30/12 $
       4286 ... $ -5,28
       /2025 -6.115.212,29
-    o:
-      15/12
-      3500 ... $ -36,00 $ 759.520,88
-      /2025
-    Esta función arma "bloques" por movimiento.
+
+    Pero a veces aparece en 1 sola línea (misma página / final de página), por ej:
+      30/12 4273 ... $ -4,90 $ -6.115.134,31
+
+    Este parser usa un autómata simple y NO desplaza saldos:
+    - Detecta DD/MM (con o sin '$')
+    - Captura COMPROBANTE + CONCEPTO + IMPORTE
+    - Si el saldo no viene en la misma línea, lo toma de la línea siguiente que contiene '/YYYY' y el saldo.
     """
     rows = []
-    i = 0
-    while i < len(lines):
-        ln = lines[i]
+    pending_ddmm = None
+    pending_year = None
+    pending_comp = None
+    pending_concept = None
+    pending_importe = None
 
-        # saltar headers obvios
-        if ln.upper().startswith("FECHA:") or "ÚLTIMOS MOV" in ln.upper() or "FECHA COMPROBANTE" in ln.upper():
-            i += 1
-            continue
-
-        mdd = DATE_DDMM_RE.match(ln)
-        if not mdd:
-            i += 1
-            continue
-
-        ddmm = mdd.group("ddmm")
-        chunk = [ln]
-        i += 1
-
-        yyyy = None
-        # acumular hasta encontrar /yyyy o una fecha completa
-        while i < len(lines):
-            ln2 = lines[i]
-            if DATE_DDMM_RE.match(ln2) and yyyy is not None:
-                break
-
-            chunk.append(ln2)
-
-            my = YEAR_RE.match(ln2)
-            if my:
-                yyyy = my.group("yyyy")
-                i += 1
-                break
-
-            if FULL_DATE_RE.search(ln2):
-                yyyy = FULL_DATE_RE.search(ln2).group(0).split("/")[-1]
-                i += 1
-                break
-
-            i += 1
-
-        if yyyy is None:
-            continue
-
-        rows.append(" ".join(chunk))
-
-    return rows
-
-
-def parse_rows_to_df(rows: list[str]) -> pd.DataFrame:
-    out = []
-    seq = 0
-    for r in rows:
-        mdd = re.search(r"\b(\d{1,2}/\d{1,2})\b", r)
-        my = re.search(r"/(20\d{2})\b", r)
-        if not mdd or not my:
-            continue
-        fecha_str = f"{mdd.group(1)}/{my.group(1)}"
+    def flush_with_saldo(saldo_val):
+        nonlocal pending_ddmm, pending_year, pending_comp, pending_concept, pending_importe
+        if not pending_ddmm or not pending_year or pending_comp is None or pending_importe is None:
+            pending_ddmm = pending_year = pending_comp = pending_concept = pending_importe = None
+            return
+        fecha_str = f"{pending_ddmm}/{pending_year}"
         fecha = pd.to_datetime(fecha_str, dayfirst=True, errors="coerce")
-        if pd.isna(fecha):
+        rows.append({
+            "fecha": fecha,
+            "comprobante": str(pending_comp),
+            "concepto": (pending_concept or "").strip(),
+            "importe": float(pending_importe),
+            "saldo": float(saldo_val) if saldo_val is not None else np.nan,
+        })
+        pending_ddmm = pending_year = pending_comp = pending_concept = pending_importe = None
+
+    for ln in lines:
+        u = (ln or "").strip()
+        if not u:
             continue
 
-        monies = list(MONEY_RE.finditer(r))
-        if len(monies) < 2:
+        # Saltar headers obvios
+        up = u.upper()
+        if up.startswith("FECHA:") or "ÚLTIMOS MOV" in up or "FECHA COMPROBANTE" in up:
             continue
 
-        saldo = normalize_money(monies[-1].group(0))
-        importe = normalize_money(monies[-2].group(0))
+        # Caso: línea combinada con DD/MM al inicio
+        # 30/12 4273 CONCEPTO $ -4,90 $ -6.115.134,31
+        m_combo = re.match(r'^(\d{2}/\d{2})\s+(\d{3,})\s+(.*)$', u)
+        if m_combo:
+            ddmm = m_combo.group(1)
+            comp = m_combo.group(2)
+            rest = m_combo.group(3)
 
-        tail = r.split(mdd.group(1), 1)[-1]
-        mint = INT_RE.search(tail)
-        comprobante = mint.group(0) if mint else ""
+            monies = MONEY_RE.findall(rest)
+            if len(monies) >= 2:
+                imp = normalize_money(monies[0])
+                saldo = normalize_money(monies[-1])
+                # año puede venir en otra línea; intentar inferir luego si aparece '/YYYY' sin movimiento
+                # Si no hay año aquí, lo dejamos pendiente pero ya tenemos saldo e importe.
+                pending_ddmm = ddmm
+                pending_comp = comp
+                pending_concept = re.sub(r'\$\s*-?\d{1,3}(?:\.\d{3})*,\d{2}.*$', '', rest).strip()
+                pending_importe = imp
+                # si hay año en la misma línea
+                my = re.search(r'/(20\d{2})\b', u)
+                if my:
+                    pending_year = my.group(1)
+                    flush_with_saldo(saldo)
+                else:
+                    # sin año: guardamos saldo temporal y esperamos línea "/YYYY" sola;
+                    # si no aparece, se descarta por falta de fecha completa
+                    pending_year = None
+                    # stash saldo en el concepto para no perderlo (truco simple)
+                    pending_concept = (pending_concept or "").strip()
+                    pending_importe = imp
+                    # guardamos saldo como float en pending_importe? no; usamos un buffer aparte
+                    # Solución: si no hay año, igual intentamos con año de contexto posterior.
+                    # Dejamos pendiente el saldo en una variable auxiliar:
+                continue
 
-        idx_imp_start = monies[-2].start()
-        if comprobante:
-            pos = r.find(comprobante)
-            concept_slice = r[pos + len(comprobante): idx_imp_start]
-        else:
-            pos = r.find(mdd.group(1))
-            concept_slice = r[pos + len(mdd.group(1)): idx_imp_start]
+        # Detectar línea DD/MM sola (con o sin $)
+        m_ddmm = re.match(r'^(\d{2}/\d{2})\s*\$?$', u)
+        if m_ddmm:
+            pending_ddmm = m_ddmm.group(1)
+            pending_year = None
+            pending_comp = None
+            pending_concept = None
+            pending_importe = None
+            continue
 
-        concepto = concept_slice.replace("$", " ").replace("/" + my.group(1), " ").strip()
-        concepto = " ".join(concepto.split())
+        # Detectar línea de movimiento: "4286 ... $ -5,28" (puede traer saldo también)
+        m_mov = re.match(r'^(\d{3,})\s+(.*)$', u)
+        if m_mov and pending_ddmm:
+            pending_comp = m_mov.group(1)
+            rest = m_mov.group(2)
 
-        seq += 1
-        out.append(
-            {
-                "fecha": fecha,
-                "comprobante": comprobante,
-                "concepto": concepto,
-                "importe": float(importe),
-                "saldo": float(saldo),
-                "orden": seq,
-            }
-        )
+            monies = MONEY_RE.findall(rest)
+            if not monies:
+                continue
 
-    return pd.DataFrame(out)
+            # Si hay 2 importes, el último es saldo
+            if len(monies) >= 2:
+                pending_importe = normalize_money(monies[0])
+                saldo = normalize_money(monies[-1])
+                pending_concept = re.sub(r'\$\s*-?\d{1,3}(?:\.\d{3})*,\d{2}.*$', '', rest).strip()
+                my = re.search(r'/(20\d{2})\b', u)
+                if my:
+                    pending_year = my.group(1)
+                    flush_with_saldo(saldo)
+                else:
+                    # saldo ya está, falta el año (puede venir en la próxima línea "/2025")
+                    pending_year = None
+                continue
 
+            # Caso normal: 1 solo importe (el movimiento); saldo viene en línea siguiente
+            pending_importe = normalize_money(monies[0])
+            pending_concept = re.sub(r'\$\s*-?\d{1,3}(?:\.\d{3})*,\d{2}.*$', '', rest).strip()
+            continue
 
-# ---------------- clasificación ----------------
-RE_IVA_BASE = re.compile(r"\bI\.?V\.?A\.?\s*BASE\b|\bIVA\s*BASE\b", re.IGNORECASE)
-RE_RG2408 = re.compile(r"RG\.?\s*2408", re.IGNORECASE)
-RE_LEY25413 = re.compile(r"LEY\s*25413|GRAVAMEN\s+LEY\s*25413|IMPTRANS|IMP\.\s*S/(DEB|CRED)", re.IGNORECASE)
+        # Detectar línea "/YYYY SALDO"
+        if pending_ddmm and pending_comp and pending_importe is not None:
+            my = re.search(r'/(20\d{2})\b', u)
+            monies = MONEY_RE.findall(u)
+            if my and monies:
+                pending_year = my.group(1)
+                saldo = normalize_money(monies[-1])
+                flush_with_saldo(saldo)
+                continue
 
+    return pd.DataFrame(rows)
 
-def clasificar(concepto: str) -> str:
-    c = (concepto or "")
-    if RE_IVA_BASE.search(c):
-        return "IVA BASE 21%"
-    if RE_RG2408.search(c) or "RETEN" in c.upper():
-        return "Percepciones IVA RG 2408"
-    if RE_LEY25413.search(c):
-        return "Ley 25.413"
-    return "Otros"
 
 
 def build_resumen_operativo(df: pd.DataFrame) -> pd.DataFrame:
@@ -254,8 +264,7 @@ if uploaded is None:
 
 data = uploaded.read()
 lines = extract_text_lines(io.BytesIO(data))
-rows = merge_bna_plus_rows(lines)
-df = parse_rows_to_df(rows)
+df = parse_bna_plus_lines_to_df(lines)
 
 if df.empty:
     st.error("No se detectaron movimientos. Este PDF tiene un layout distinto o está escaneado.")
@@ -328,6 +337,7 @@ res_view["Importe"] = res_view["Importe"].map(fmt_ar)
 st.dataframe(res_view, use_container_width=True)
 
 st.subheader("Detalle de movimientos")
+df_view = df.drop(columns=["comp_num"], errors="ignore").copy()
 for c in ["importe", "debito", "credito", "saldo"]:
     df_view[c] = df_view[c].map(fmt_ar)
 st.dataframe(
