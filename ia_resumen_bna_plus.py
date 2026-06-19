@@ -55,11 +55,13 @@ except Exception:
 
 
 # ---------------- regex ----------------
-DATE_DDMM_RE = re.compile(r"\b(\d{1,2})/(\d{1,2})\b")          # dd/mm (sin año)
+DATE_DDMM_RE = re.compile(r"^(\d{1,2})/(\d{1,2})\b")          # dd/mm al inicio de bloque
 YEAR_RE = re.compile(r"\b(20\d{2})\b")                        # 20xx
-COMP_RE = re.compile(r"\b(\d{3,10})\b")                       # comprobante (número)
-# Importe con signo: -5,28 o 5,28-
-MONEY_RE = re.compile(r"(?<!\S)-?(?:\d{1,3}(?:\.\d{3})*|\d+),\d{2}-?(?!\S)")
+COMP_RE = re.compile(r"\b(\d{3,10})\b")                       # comprobante
+
+# Importe argentino. Importante: NO usar "-" final como signo, porque BNA pega saldos:
+# ejemplo real: -11.220.141,18-18.920.898,65
+MONEY_RE = re.compile(r"-?(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2}")
 
 # Clasificación mínima para resumen operativo
 RE_IVA_BASE = re.compile(r"\bI\.?V\.?A\.?\s*BASE\b", re.IGNORECASE)
@@ -71,11 +73,11 @@ RE_SIRCREB = re.compile(r"\bREG\.?\s*REC\.?\s*SIRCREB\b", re.IGNORECASE)
 
 # ---------------- utils ----------------
 def normalize_money(tok: str) -> float:
-    """Normaliza importes argentinos, aceptando: -5,28   ó   5,28-   ó  1.234,56"""
+    """Normaliza importes argentinos: -5,28 ó 1.234,56"""
     if not tok:
         return np.nan
     tok = tok.strip().replace("−", "-")
-    neg = tok.startswith("-") or tok.endswith("-")
+    neg = tok.startswith("-")
     tok = tok.strip("-").strip()
     if "," not in tok:
         return np.nan
@@ -109,198 +111,165 @@ def extract_lines(file_like) -> list[str]:
             txt = p.extract_text() or ""
             for raw in txt.splitlines():
                 ln = " ".join(raw.split())
-                if ln.strip():
-                    out.append(ln)
+                if not ln.strip():
+                    continue
+                # Sacamos encabezados/pie para que no contaminen el parser por bloques
+                if ln.startswith("Jueves ") or ln.startswith("Últimos movimientos"):
+                    continue
+                if ln.startswith("Fecha Comprobante Concepto Monto Saldo"):
+                    continue
+                if ln.startswith("Página "):
+                    continue
+                out.append(ln)
     return out
 
 
 def parse_bna_plus_movs(lines: list[str]) -> pd.DataFrame:
     """
-    Parser robusto BNA+:
-    - Movimientos pueden venir en 1 línea o partidos en 2-3 líneas.
-    - Columnas resultantes: fecha, comprobante, concepto, importe, saldo, orden
-    - FECHA: dd/mm + año detectado en el bloque. Si no se detecta, se usa el primer 20xx cercano.
+    Parser BNA+ basado en bloques reales del PDF.
+
+    Regla clave de Banco Nación PLUS:
+    - La columna "Saldo" impresa es el saldo ANTES de aplicar el movimiento de esa línea.
+    - El PDF viene del movimiento más nuevo al más viejo.
+    - En algunos movimientos BNA/PDF pega o invierte Monto/Saldo visualmente.
+      Por eso se elige cuál de los dos importes es saldo usando continuidad:
+          saldo_de_esta_linea + importe_de_esta_linea = saldo_de_la_linea_anterior
     """
-    rows = []
-    orden = 0
+    blocks: list[list[str]] = []
+    cur: list[str] | None = None
 
-    # Año "vigente" dentro del bloque de movimientos
-    current_year = None
     for ln in lines:
-        y = YEAR_RE.search(ln)
-        if y:
-            current_year = int(y.group(1))
-            break
+        if DATE_DDMM_RE.match(ln):
+            if cur:
+                blocks.append(cur)
+            cur = [ln]
+        elif cur:
+            cur.append(ln)
 
-    def build_fecha(dd: int, mm: int, year: int | None) -> pd.Timestamp:
-        yy = year if year else 2000
-        return pd.to_datetime(f"{yy:04d}-{mm:02d}-{dd:02d}", errors="coerce")
+    if cur:
+        blocks.append(cur)
 
-    # Helpers para detectar movimiento en una sola línea:
-    # Esperamos: dd/mm ... comprobante ... concepto ... importe ... saldo
-    def try_parse_one_line(ln: str) -> dict | None:
-        d = DATE_DDMM_RE.search(ln)
+    raw_rows = []
+    for orden, block in enumerate(blocks, start=1):
+        txt = " ".join(block)
+        d = DATE_DDMM_RE.match(block[0])
         if not d:
-            return None
-        monies = list(MONEY_RE.finditer(ln))
+            continue
+
+        dd = int(d.group(1))
+        mm = int(d.group(2))
+        y = YEAR_RE.search(txt)
+        year = int(y.group(1)) if y else 2026
+
+        monies = [normalize_money(m.group(0)) for m in MONEY_RE.finditer(txt)]
         if len(monies) < 2:
-            return None
+            continue
 
-        dd = int(d.group(1))
-        mm = int(d.group(2))
+        # Los dos últimos importes del bloque son Monto y Saldo, pero a veces el PDF los invierte.
+        cand1 = float(monies[-2])
+        cand2 = float(monies[-1])
 
-        # saldo: último money; importe: penúltimo money
-        saldo = normalize_money(monies[-1].group(0))
-        importe = normalize_money(monies[-2].group(0))
+        clean = txt
+        clean = re.sub(r"^\d{1,2}/\d{1,2}\s*", "", clean)
+        clean = re.sub(r"/20\d{2}", "", clean)
+        clean = clean.replace("$", " ")
+        clean = MONEY_RE.sub(" ", clean)
+        clean = " ".join(clean.split())
 
-        # recorte para extraer comprobante y concepto
-        left = ln[d.end(): monies[-2].start()].strip()
-        # comprobante: primer número grande que aparezca
-        mc = COMP_RE.search(left)
+        mc = COMP_RE.search(clean)
         comp = mc.group(1) if mc else ""
-        concept = left
-        # si encontramos comprobante, lo sacamos del concepto textual
+        concept = clean
         if mc:
-            concept = (left[: mc.start()] + left[mc.end():]).strip()
-            # limpia restos
-            concept = " ".join(concept.split())
+            concept = (clean[: mc.start()] + clean[mc.end():]).strip()
 
-        return {
-            "fecha": build_fecha(dd, mm, current_year),
-            "comprobante": comp,
-            "concepto": concept,
-            "importe": float(importe),
-            "saldo": float(saldo),
-        }
+        # Quita CUIT sueltos si quedaron en el concepto; el dato no hace falta para el resumen.
+        concept = re.sub(r"\b\d{11}\b", "", concept)
+        concept = " ".join(concept.split())
 
-    # Parser multi-línea (patrón típico):
-    # L1: "30/12 $"  (o "30/12")
-    # L2: "{comp} {concepto} $ {importe}"
-    # L3: "/2025 $ {saldo}"  (a veces con espacios)
-    i = 0
-    n = len(lines)
-    while i < n:
-        ln = lines[i]
+        raw_rows.append(
+            {
+                "fecha": pd.to_datetime(f"{year:04d}-{mm:02d}-{dd:02d}", errors="coerce"),
+                "comprobante": comp,
+                "concepto": concept,
+                "cand1": cand1,
+                "cand2": cand2,
+                "orden": orden,
+            }
+        )
 
-        parsed = try_parse_one_line(ln)
-        if parsed:
-            orden += 1
-            parsed["orden"] = orden
-            rows.append(parsed)
-            i += 1
-            continue
+    if not raw_rows:
+        return pd.DataFrame(columns=["fecha", "comprobante", "concepto", "importe", "saldo", "orden"])
 
-        d = DATE_DDMM_RE.search(ln)
-        if not d:
-            # refresca año si aparece
-            y = YEAR_RE.search(ln)
-            if y:
-                current_year = int(y.group(1))
-            i += 1
-            continue
+    raw = pd.DataFrame(raw_rows)
 
-        # Si hay fecha pero no es one-line, intentamos multi-line
-        dd = int(d.group(1))
-        mm = int(d.group(2))
+    saldos = []
+    importes = []
 
-        # buscar línea de detalle (i+1) y línea de saldo (i+2)
-        if i + 2 >= n:
-            i += 1
-            continue
+    for i, r in raw.iterrows():
+        c1 = float(r["cand1"])
+        c2 = float(r["cand2"])
 
-        ln2 = lines[i + 1]
-        ln3 = lines[i + 2]
+        if i < len(raw) - 1:
+            # El saldo de esta línea debe ser igual al resultado de la línea siguiente:
+            # saldo_siguiente + importe_siguiente. Como en el crudo no sabemos cuál es cuál,
+            # la suma cand1+cand2 de la línea siguiente da ese resultado.
+            target = float(raw.loc[i + 1, "cand1"] + raw.loc[i + 1, "cand2"])
 
-        # ln2 debe tener al menos 1 money (importe)
-        m2 = list(MONEY_RE.finditer(ln2))
-        m3 = list(MONEY_RE.finditer(ln3))
-        y3 = YEAR_RE.search(ln3) or YEAR_RE.search(ln2) or YEAR_RE.search(ln)
+            c1_es_saldo = abs(c1 - target) <= 0.02
+            c2_es_saldo = abs(c2 - target) <= 0.02
 
-        if y3:
-            current_year = int(y3.group(1))
+            if c1_es_saldo and not c2_es_saldo:
+                saldo, importe = c1, c2
+            elif c2_es_saldo and not c1_es_saldo:
+                saldo, importe = c2, c1
+            else:
+                # Fallback: en la mayoría de las líneas el último importe es saldo.
+                saldo, importe = c2, c1
+        else:
+            # Último movimiento del período: no hay línea siguiente para validar.
+            # En BNA+ normalmente el último importe impreso es el saldo.
+            saldo, importe = c2, c1
 
-        if len(m2) >= 1 and len(m3) >= 1:
-            # importe: último money de ln2
-            importe = normalize_money(m2[-1].group(0))
-            # saldo: último money de ln3
-            saldo = normalize_money(m3[-1].group(0))
+        saldos.append(float(saldo))
+        importes.append(float(importe))
 
-            # comprobante + concepto: parte izquierda de ln2 hasta el money
-            left2 = ln2[: m2[-1].start()].strip()
-            mc = COMP_RE.search(left2)
-            comp = mc.group(1) if mc else ""
-            concept = left2
-            if mc:
-                concept = (left2[: mc.start()] + left2[mc.end():]).strip()
-                concept = " ".join(concept.split())
+    raw["saldo"] = saldos
+    raw["importe"] = importes
 
-            # Validación básica
-            if not np.isnan(importe) and not np.isnan(saldo):
-                orden += 1
-                rows.append(
-                    {
-                        "fecha": build_fecha(dd, mm, current_year),
-                        "comprobante": comp,
-                        "concepto": concept,
-                        "importe": float(importe),
-                        "saldo": float(saldo),
-                        "orden": orden,
-                    }
-                )
-                i += 3
-                continue
+    df = raw[["fecha", "comprobante", "concepto", "importe", "saldo", "orden"]].copy()
 
-        # si falló el multi-line, avanzamos
-        i += 1
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    # Normalizaciones mínimas
     df["comprobante"] = df["comprobante"].astype(str).str.strip()
     df["concepto"] = df["concepto"].astype(str).str.strip()
     df["comp_num"] = pd.to_numeric(df["comprobante"], errors="coerce")
 
-    # Orden final (clave para "último movimiento")
-    df = df.sort_values(["fecha", "comp_num", "orden"]).reset_index(drop=True)
-    return df
+    # NO ordenar por fecha/comprobante: el orden del PDF es imprescindible para conciliar.
+    return df.reset_index(drop=True)
 
 
 def resumen_operativo(df: pd.DataFrame) -> pd.DataFrame:
     """
     Resumen Operativo BNA+ (según tus reglas):
     - I.V.A BASE (21%): se toma como IVA 21% y el neto (COMISIÓN) se calcula como IVA/0.21
-      (solo si existe COMISIÓN asociable; práctica: neto = IVA/0.21)
-    - RETEN. I.V.A. RG.2408: percepciones IVA (se suman en valor absoluto de débitos)
-    - SIRCREB: recaudación bancaria de IIBB (se suma en valor absoluto de débitos)
-    - LEY 25413: sumar S/DEB y S/CRED en un mismo neto:
-      se suma por signo del IMPORTE (si hay acreditaciones/devoluciones, restan)
+    - RETEN. I.V.A. RG.2408: percepciones IVA (valor absoluto de débitos)
+    - SIRCREB: recaudación bancaria de IIBB (valor absoluto de débitos)
+    - LEY 25413: S/DEB + S/CRED neto
     """
     if df.empty:
         return pd.DataFrame(columns=["Concepto", "Importe"])
 
-    # IVA BASE: en BNA+ normalmente aparece como débito (importe negativo)
-    iva_base = float(df.loc[df["concepto"].str.contains(RE_IVA_BASE), "importe"].sum() or 0.0)
-    iva_base_abs = abs(iva_base)  # se muestra como gasto/IVA
+    iva_base = float(df.loc[df["concepto"].str.contains(RE_IVA_BASE, na=False), "importe"].sum() or 0.0)
+    iva_base_abs = abs(iva_base)
 
-    # Neto comisión 21: inversa IVA/0.21
     neto_com_21 = round(iva_base_abs / 0.21, 2) if iva_base_abs else 0.0
 
-    # Reten IVA RG2408: suma en valor absoluto si vienen negativos
-    ret_iva = float(df.loc[df["concepto"].str.contains(RE_RET_IVA_2408), "importe"].sum() or 0.0)
+    ret_iva = float(df.loc[df["concepto"].str.contains(RE_RET_IVA_2408, na=False), "importe"].sum() or 0.0)
     ret_iva_abs = abs(ret_iva)
 
-    # SIRCREB: recaudación bancaria de Ingresos Brutos.
-    # En BNA+ normalmente aparece como débito: REG.REC.SIRCREB STA.FE
-    sircreb = float(df.loc[df["concepto"].str.contains(RE_SIRCREB), "importe"].sum() or 0.0)
+    sircreb = float(df.loc[df["concepto"].str.contains(RE_SIRCREB, na=False), "importe"].sum() or 0.0)
     sircreb_abs = abs(sircreb)
 
-    # Ley 25413 neto (S/DEB + S/CRED, devoluciones restan por signo)
-    ley = float(df.loc[df["concepto"].str.contains(RE_LEY_25413), "importe"].sum() or 0.0)
-    ley_abs = abs(ley) if ley < 0 else ley  # si queda neto negativo, lo mostramos como negativo? preferimos neto tal cual
-    # Para registración como gasto neto: normalmente debita (negativo). Si hay devoluciones (positivas), restan.
-    ley_neto_gasto = -ley  # gasto positivo si ley fue negativo neto
+    ley = float(df.loc[df["concepto"].str.contains(RE_LEY_25413, na=False), "importe"].sum() or 0.0)
+    ley_neto_gasto = -ley  # gasto positivo si el neto fue débito
 
     out = [
         ["COMISIÓN (NETO 21%)", neto_com_21],
@@ -346,15 +315,13 @@ df["credito"] = np.where(df["importe"] > 0, df["importe"], 0.0)
 # ---------------- Conciliación ----------------
 st.subheader("Conciliación bancaria")
 
-# Reglas BNA+ (según tu criterio operativo):
-# - Saldo anterior: primer saldo impreso del período.
-# - Saldo final: NO aparece impreso; se infiere como:
-#     saldo_final_inferido = último_saldo_impreso + último_importe (con signo).
-saldo_anterior = float(df["saldo"].iloc[0])
-
-ultimo_saldo_impreso = float(df["saldo"].iloc[-1])
-ultimo_importe = float(df["importe"].iloc[-1])
-saldo_final_inferido = ultimo_saldo_impreso + ultimo_importe
+# Reglas BNA+:
+# - El PDF viene del movimiento más nuevo al más viejo.
+# - La columna "Saldo" es el saldo ANTES del movimiento.
+# - Saldo anterior del período: saldo del último movimiento impreso.
+# - Saldo final inferido: saldo del primer movimiento + importe del primer movimiento.
+saldo_anterior = float(df["saldo"].iloc[-1])
+saldo_final_inferido = float(df["saldo"].iloc[0] + df["importe"].iloc[0])
 
 total_debitos = float(df["debito"].sum())
 total_creditos = float(df["credito"].sum())
