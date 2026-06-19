@@ -66,6 +66,7 @@ RE_IVA_BASE = re.compile(r"\bI\.?V\.?A\.?\s*BASE\b", re.IGNORECASE)
 RE_RET_IVA_2408 = re.compile(r"\bRETEN\.?\s*I\.?V\.?A\.?\s*RG\.?\s*2408\b", re.IGNORECASE)
 RE_LEY_25413 = re.compile(r"\bLEY\s*25\.?413\b|\bGRAVAMEN\s+LEY\s*25\.?413\b", re.IGNORECASE)
 RE_COMISION = re.compile(r"\bCOMISI[ÓO]N\b", re.IGNORECASE)
+RE_SIRCREB = re.compile(r"\bREG\.?\s*REC\.?\s*SIRCREB\b", re.IGNORECASE)
 
 
 # ---------------- utils ----------------
@@ -272,6 +273,7 @@ def resumen_operativo(df: pd.DataFrame) -> pd.DataFrame:
     - I.V.A BASE (21%): se toma como IVA 21% y el neto (COMISIÓN) se calcula como IVA/0.21
       (solo si existe COMISIÓN asociable; práctica: neto = IVA/0.21)
     - RETEN. I.V.A. RG.2408: percepciones IVA (se suman en valor absoluto de débitos)
+    - SIRCREB: recaudación bancaria de IIBB (se suma en valor absoluto de débitos)
     - LEY 25413: sumar S/DEB y S/CRED en un mismo neto:
       se suma por signo del IMPORTE (si hay acreditaciones/devoluciones, restan)
     """
@@ -289,6 +291,11 @@ def resumen_operativo(df: pd.DataFrame) -> pd.DataFrame:
     ret_iva = float(df.loc[df["concepto"].str.contains(RE_RET_IVA_2408), "importe"].sum() or 0.0)
     ret_iva_abs = abs(ret_iva)
 
+    # SIRCREB: recaudación bancaria de Ingresos Brutos.
+    # En BNA+ normalmente aparece como débito: REG.REC.SIRCREB STA.FE
+    sircreb = float(df.loc[df["concepto"].str.contains(RE_SIRCREB), "importe"].sum() or 0.0)
+    sircreb_abs = abs(sircreb)
+
     # Ley 25413 neto (S/DEB + S/CRED, devoluciones restan por signo)
     ley = float(df.loc[df["concepto"].str.contains(RE_LEY_25413), "importe"].sum() or 0.0)
     ley_abs = abs(ley) if ley < 0 else ley  # si queda neto negativo, lo mostramos como negativo? preferimos neto tal cual
@@ -299,6 +306,7 @@ def resumen_operativo(df: pd.DataFrame) -> pd.DataFrame:
         ["COMISIÓN (NETO 21%)", neto_com_21],
         ["I.V.A BASE (21%)", iva_base_abs],
         ["RETEN. I.V.A. RG.2408", ret_iva_abs],
+        ["SIRCREB", sircreb_abs],
         ["GRAVAMEN LEY 25.413 (NETO)", float(ley_neto_gasto)],
     ]
     total = sum(x[1] for x in out)
